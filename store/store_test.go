@@ -116,6 +116,86 @@ func TestExpiredRemovedOnList(t *testing.T) {
 	}
 }
 
+func TestExpiredRemovedByCleanupLoop(t *testing.T) {
+	old := CleanupInterval
+	CleanupInterval = 10 * time.Millisecond
+	defer func() { CleanupInterval = old }()
+
+	s := New()
+	expired := time.Now().Add(30 * time.Millisecond)
+	s.Create(testPaste("expired", &expired))
+	s.Create(testPaste("kept", nil))
+
+	// Wait for the background goroutine to purge the expired entry with no
+	// Get/List/Delete access at all. The map is inspected directly under the
+	// mutex, so the probe itself never removes or expires anything.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		_, present := s.pastes["expired"]
+		s.mu.Unlock()
+		if !present {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s.mu.Lock()
+	_, expiredPresent := s.pastes["expired"]
+	_, keptPresent := s.pastes["kept"]
+	s.mu.Unlock()
+
+	if expiredPresent {
+		t.Fatal("expected expired paste to be removed by the cleanup loop without any Get/List/Delete access")
+	}
+	if !keptPresent {
+		t.Fatal("expected non-expired paste to survive the cleanup loop")
+	}
+}
+
+func TestCreateLimit(t *testing.T) {
+	old := MaxPastes
+	MaxPastes = 2
+	defer func() { MaxPastes = old }()
+
+	s := New()
+	if !s.Create(testPaste("a", nil)) {
+		t.Fatal("expected Create to succeed under the limit")
+	}
+	if !s.Create(testPaste("b", nil)) {
+		t.Fatal("expected Create to succeed when the map reaches the limit")
+	}
+	if s.Create(testPaste("c", nil)) {
+		t.Fatal("expected Create to fail once the map holds MaxPastes entries")
+	}
+}
+
+func TestConcurrentWithCleanupLoop(t *testing.T) {
+	old := CleanupInterval
+	CleanupInterval = time.Millisecond
+	defer func() { CleanupInterval = old }()
+
+	s := New()
+	const workers = 20
+	const perWorker = 50
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				id := fmt.Sprintf("p-%d-%d", w, i)
+				expires := time.Now().Add(time.Duration(w+i) * time.Millisecond)
+				s.Create(testPaste(id, &expires))
+				s.Get(id)
+				s.List()
+			}
+		}(w)
+	}
+	wg.Wait()
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	s := New()
 	const workers = 50

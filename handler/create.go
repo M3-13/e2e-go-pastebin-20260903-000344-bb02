@@ -50,16 +50,18 @@ func (h *Handler) CreatePaste(w http.ResponseWriter, r *http.Request) {
 		p.ExpiresAt = &expires
 	}
 
-	for {
-		id, err := newPasteID()
-		if err != nil {
-			WriteError(w, http.StatusInternalServerError, "could not generate id")
-			return
-		}
-		p.ID = id
-		if h.store.Create(p) {
-			break
-		}
+	id, err := newPasteID()
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "could not generate id")
+		return
+	}
+	p.ID = id
+	if !h.store.Create(p) {
+		// Create reports failure on an ID collision or when the store is full;
+		// both are indistinguishable here, so fail the request instead of
+		// looping forever once the store has reached MaxPastes.
+		WriteError(w, http.StatusServiceUnavailable, "paste store is full")
+		return
 	}
 
 	WriteJSON(w, http.StatusCreated, map[string]string{"id": p.ID})
