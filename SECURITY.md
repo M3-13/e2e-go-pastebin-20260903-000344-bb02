@@ -1,121 +1,50 @@
-# Sicherheitsrichtlinie
+VERDICT: CHANGES_REQUESTED
 
-Dieses Dokument beschreibt das Sicherheitsmodell der Pastebin-REST-API, die
-unterstützten Versionen, den Meldeweg für Sicherheitslücken und die
-Update-/Patch-Prozedur. Es richtet sich an Betreiber, Entwickler und
-Sicherheitsforscher.
+Manuelle Analyse des Go-Backends. Es wurde kein Scanner-Output für diesen Projekttyp geliefert; die Bewertung basiert auf der Codeanalyse. Es wurden keine kritischen oder hohen Schwachstellen gefunden, aber mehrere mittlere und niedrige Befunde.
 
-## Sicherheitsmodell
+## Sicherheitsbericht
 
-Die API ist ein öffentlicher Pastebin-Dienst. Es gibt keine
-Benutzerkonten und keine serverseitige Sitzung. Der Zugriffsschutz beruht
-stattdessen auf drei voneinander unabhängigen Mechanismen:
+### 1. Fehlende TLS-Erzwingung im Produktivmodus
+- **Schweregrad:** mittel
+- **Datei/Stelle:** `main.go`, `main()` und `newApp()`
+- **Problem:** Wenn `CERT_FILE`/`KEY_FILE` nicht gesetzt sind, startet der Server unverschlüsselt über `http.ListenAndServe`. Dadurch werden der `X-Delete-Token` und der `X-API-Key` im Klartext übertragen und können auf dem Netzwerkweg mitgelesen werden. Der Server unterstützt TLS nur, wenn beide Dateien konfiguriert sind; ein unverschlüsselter Produktivbetrieb ist ohne Zwang möglich.
+- **Konkrete Lösung:** Im Produktivmodus erzwingen, dass TLS konfiguriert ist oder dass ausschließlich ein vorgeschalteter TLS-Terminator verwendet wird. Beispielsweise bei leerem `CERT_FILE`/`KEY_FILE` mit einem expliziten Fehler abbrechen, sofern nicht ausdrücklich ein Development-Modus gesetzt ist. Alternativ abgesicherten Betrieb hinter einem TLS-Reverse-Proxy verbindlich machen. Die bestehende HSTS-Middleware sollte weiterhin nur im TLS-Modus aktiv sein.
 
-### 1. Linkbasiertes Lesen über eine unknackbare ID
+### 2. Kein Rate-Limiting; Speicher-Erschöpfung möglich
+- **Schweregrad:** mittel
+- **Datei/Stelle:** `handler/create.go`, `store/store.go`, `main.go`
+- **Problem:** `POST /pastes` akzeptiert unbegrenzte Anfragen ohne Rate-Limiting. `MaxPastes` liegt bei 10.000 Pastes, und jeder Paste kann bis zu 1 MB Content haben. Ein Angreifer kann den In-Memory-Store mit hohem Speicherverbrauch füllen (theoretisch bis zu ~10 GiB) und damit die Verfügbarkeit des Dienstes beeinträchtigen; anschließend erhalten Neuanlagen 503.
+- **Konkrete Lösung:** Rate-Limiting pro Client-IP oder API-Key als Middleware einführen. Zusätzlich ein globales Speicher-Budget (Bytes) durchsetzen und/oder `MaxPastes` sowie `maxPasteBodyBytes` konservativer bzw. konfigurierbar gestalten. Bei Überschreitung sauber 429 oder, falls der Store voll ist, einen klar dokumentierten 503 zurückgeben.
 
-Jeder Paste erhält beim Anlegen eine zufällige ID aus 32 Hex-Zeichen, die aus
-16 Bytes von `crypto/rand` erzeugt wird (128 Bit Entropie). Die ID ist der
-einzige Schlüssel zum Lesen: `GET /pastes/{id}` ist unauthentifiziert und
-liefert den Inhalt an jeden, der die ID kennt (Capability-Modell).
+### 3. X-API-Key-Vergleich nicht zeitkonstant
+- **Schweregrad:** niedrig
+- **Datei/Stelle:** `handler/list.go`, Funktion `apiKeyAuthorized`
+- **Problem:** Der API-Key wird mit `r.Header.Get("X-API-Key") == expected` verglichen. Dieser Vergleich läuft nicht in konstanter Zeit und kann theoretisch Timing-Angriffe auf den List-API-Key erleichtern.
+- **Konkrete Lösung:** `crypto/subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1` verwenden, analog zum Delete-Token-Vergleich in `handler/delete.go`.
 
-- Wer die ID nicht kennt, kann den Paste nicht abrufen; ein Erraten ist
-  kryptographisch nicht praktikabel.
-- Die ID wird in der URL übertragen und gilt als vertraulich. Sie darf nicht
-  protokolliert, in Referrer-Headern oder in Zugriffsprotokollen Dritter
-  auftauchen (der Betreiber muss dies in vorgelagerten Proxies unterbinden).
+### 4. Fehlende Cache-Control-Header
+- **Schweregrad:** niedrig
+- **Datei/Stelle:** `handler/handler.go`, `WriteJSON`
+- **Problem:** Alle JSON-Antworten werden ohne `Cache-Control` ausgeliefert. Besonders kritisch ist die Antwort von `POST /pastes`, die den `delete_token` enthält, sowie `GET /pastes/{id}`, der den eigentlich vertraulichen Paste-Inhalt liefert. Browser oder Zwischen-Proxys können diese Antworten cachen.
+- **Konkrete Lösung:** In `WriteJSON` vor dem Schreiben des Bodys `Cache-Control: no-store` setzen. Das verhindert, dass sensible Inhalte und Delete-Tokens in Browser- oder Proxy-Caches verbleiben, ohne die API-Funktion zu beeinträchtigen.
 
-### 2. Delete-Token für das Löschen
+### 5. JSON-Decoder akzeptiert anhängende Daten
+- **Schweregrad:** niedrig
+- **Datei/Stelle:** `handler/create.go`, `CreatePaste`
+- **Problem:** `json.NewDecoder(r.Body).Decode(&req)` liest nur das erste JSON-Objekt und ignoriert weitere Daten im Request-Body. Ein Body wie `{"content":"x"}{"evil":true}` wird akzeptiert, obwohl er formal mehr als ein JSON-Objekt enthält. Das ist derzeit nicht direkt ausnutzbar, aber eine unsaubere Eingabevalidierung.
+- **Konkrete Lösung:** Body nach dem initialen Decode vollständig auf nur Whitespace prüfen oder alternativ den Body mit `io.ReadAll` im Rahmen des Limits lesen und anschließend mit `json.Unmarshal` verarbeiten. `http.MaxBytesReader` weiterhin zuerst setzen.
 
-Beim Anlegen liefert `POST /pastes` zusätzlich zur ID ein `delete_token`
-(ebenfalls 32 Hex-Zeichen aus `crypto/rand`). Löschen ist nur mit diesem Token
-möglich: `DELETE /pastes/{id}` verlangt den Header `X-Delete-Token`, der dem
-Token des Pastes entsprechen muss. Der Vergleich erfolgt in konstanter Zeit
-(`crypto/subtle.ConstantTimeCompare`), um Timing-Angriffe auszuschließen.
+### 6. CORS-Preflight nicht vollständig behandelt
+- **Schweregrad:** niedrig
+- **Datei/Stelle:** `main.go`, `corsMiddleware`
+- **Problem:** Die Middleware setzt bei erlaubtem Origin nur `Access-Control-Allow-Origin`. Browser-Sendeanfragen mit `Content-Type: application/json`, `X-Delete-Token` oder `X-API-Key` lösen einen Preflight (`OPTIONS`) aus. Dieser wird aktuell als `405 Method Not Allowed` beantwortet, ohne die nötigen CORS-Header. Dadurch können legitime Browser-Clients mit erlaubtem Origin die API nicht nutzen; die erlaubte Ursprungseinschränkung selbst ist korrekt.
+- **Konkrete Lösung:** `OPTIONS`-Preflight-Behandlung ergänzen, die für erlaubte Origins `Access-Control-Allow-Methods: GET, POST, DELETE` und `Access-Control-Allow-Headers: Content-Type, X-Delete-Token, X-API-Key` setzt, sowie `Vary` entsprechend erweitert. So bleibt die Allowlist streng, die API wird aber für die eigenen legitimen Browser-Clients nutzbar.
 
-- Ohne gültiges Token antwortet die API mit `401`.
-- Das Token wird ausschließlich in der Antwort auf `POST /pastes` zurückgegeben
-  und nirgends gespeichert oder protokolliert. Es ist geheim zu behandeln.
-- Wer ein `delete_token` verliert, kann den zugehörigen Paste nicht löschen.
-
-### 3. API-Key für die Auflistung
-
-Die Metadatenauflistung `GET /pastes` ist kein öffentlicher Endpunkt: Sie
-verlangt den Header `X-API-Key`, der dem in der Umgebungsvariable
-`PASTEBIN_API_KEY` hinterlegten Wert entsprechen muss. Ist die Variable nicht
-gesetzt oder leer, ist der Endpunkt deaktiviert und antwortet immer mit `401`.
-
-- Der API-Key wird ausschließlich über die Umgebung konfiguriert und darf nie
-  im Repository oder in der Dokumentation als Klartextwert stehen.
-- Es gibt keine Unterscheidung nach Mandant oder Nutzer; ein gültiger Key
-  gewährt Zugriff auf die gesamte Liste.
-
-### Weitere Schutzmaßnahmen
-
-- **Begrenzung des Request-Bodys:** `POST /pastes` liest höchstens 1 MB
-  (`http.MaxBytesReader`); größere Anfragen werden mit `413` abgewiesen.
-- **Begrenzung der Ablaufzeit:** `expires_in_seconds` ist auf etwa 10 Jahre
-  begrenzt; größere Werte werden mit `400` abgewiesen, um einen
-  `time.Duration`-Überlauf auszuschließen.
-- **Begrenzung der Pastes-Anzahl:** Der Store fasst höchstens 10 000 Pastes
-  (`store.MaxPastes`). Darüber hinaus schlägt das Anlegen mit `503` fehl.
-- **Automatischer Ablauf-Cleanup:** Abgelaufene Pastes werden beim Zugriff
-  (`Get`/`List`) sowie durch eine Hintergrund-Goroutine entfernt.
-- **Einheitliche Fehlerantworten:** Alle Antworten mit Status ≥ 400 sind ein
-  JSON-Objekt mit ausschließlich einem generischen `error`-Feld — ohne
-  Stacktraces, Dateipfade oder interne Details.
-- **Transportverschlüsselung:** Der Server unterstützt TLS über die
-  Umgebungsvariablen `CERT_FILE` und `KEY_FILE`. Sind beide gesetzt, wird
-  `ListenAndServeTLS` verwendet und zusätzlich der HSTS-Header
-  `Strict-Transport-Security` gesetzt. Ohne eigene Zertifikate ist der Server
-  für den Betrieb hinter einem TLS-terminierenden Reverse-Proxy vorgesehen und
-  darf nicht direkt ins Internet exponiert werden.
-- **CORS-Allowlist:** Der `Access-Control-Allow-Origin`-Header wird nur für
-  Origins gesetzt, die in `CORS_ALLOWED_ORIGINS` (kommagetrennt) aufgeführt
-  sind. Eine leere Allowlist setzt keinen Header und verweigert damit
-  standardmäßig jeden Cross-Origin-Zugriff.
-
-## Unterstützte Versionen
-
-Es wird ausschließlich die jeweils aktuelle Version unterstützt. Ältere
-Versionen erhalten keine Sicherheits-Patches.
-
-| Version | Unterstützt          |
-| ------- | -------------------- |
-| 1.0.0   | :white_check_mark:   |
-
-## Meldung von Sicherheitslücken
-
-Wenn du eine Sicherheitslücke in diesem Projekt entdeckst, melde sie bitte
-**nicht** über ein öffentliches Issue, sondern vertraulich an den Betreiber:
-
-- **E-Mail:** `security@example.invalid` (bitte durch die tatsächliche
-  Betreiberadresse ersetzen)
-- **Betreff:** `[Sicherheitslücke] <Kurzbeschreibung>`
-
-Bitte gib in der Meldung so viel Kontext wie möglich an:
-
-- betroffene Version und Komponente,
-- eine Beschreibung der Schwachstelle und ihres Auswirkungen,
-- Schritte zur Reproduktion (sofern vorhanden),
-- ein Proof-of-Concept oder eine betroffene URL, falls möglich.
-
-Wir bestätigen den Eingang innerhalb von 5 Werktagen und streben an, innerhalb
-von 90 Tagen eine Lösung zu veröffentlichen. Wir veröffentlichen Details erst,
-nachdem ein Fix bereitsteht. Sobald die Schwachstelle behoben ist, wird sie im
-CHANGELOG und ggf. in einer Sicherheitsadvisory dokumentiert.
-
-## Update- und Patch-Prozedur
-
-1. Sicherheitsrelevante Änderungen werden als regulärer Fix auf `main` gemergt
-   und über den CI-Pfad gebaut und getestet (`go build ./...`, `go test ./...`).
-2. Jede Änderung wird im [CHANGELOG.md](CHANGELOG.md) unter der entsprechenden
-   Version dokumentiert.
-3. Ein Update besteht aus dem Einspielen der neuen Version und dem Neustart des
-   Dienstes über den in `RUN.json` deklarierten Startbefehl (`go run .`).
-4. Nach einem Update sind die Umgebungsvariablen (`CERT_FILE`, `KEY_FILE`,
-   `CORS_ALLOWED_ORIGINS`, `PASTEBIN_API_KEY`) zu prüfen und, wo nötig, zu
-   erneuern (insbesondere API-Keys und Zertifikate rotieren).
-5. Wird eine Schwachstelle in einer Drittanbieter-Abhängigkeit gemeldet, ist
-   die betroffene Version zu ermitteln und ein Upgrade einzuspielen. Aktuell
-   verwendet das Projekt keine externen Abhängigkeiten über die
-   Go-Standardbibliothek hinaus (siehe `sbom.json`).
+## Positiv geprüft
+- Keine hartkodierten Secrets; API-Key und Zertifikatspfade kommen aus der Umgebung.
+- Paste-IDs und Delete-Token werden mit `crypto/rand` erzeugt (128 Bit Entropie).
+- Delete-Token-Vergleich in `handler/delete.go` nutzt bereits `crypto/subtle.ConstantTimeCompare`.
+- Fehlerantworten sind generisch und enthalten keine internen Details/Stacktraces.
+- `model.Paste` serialisiert den Delete-Token nicht (`json:"-"`); `GET /pastes` liefert nur Metadaten ohne Inhalt.
+- Abgelaufene Pastes werden bei Zugriff und periodisch entfernt.
+- Standard-CORS-Verhalten ist deny-by-default; kein Wildcard `*`.
