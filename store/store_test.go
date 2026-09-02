@@ -126,17 +126,29 @@ func TestExpiredRemovedByCleanupLoop(t *testing.T) {
 	s.Create(testPaste("expired", &expired))
 	s.Create(testPaste("kept", nil))
 
-	// Wait for the background goroutine to purge the expired entry without any
-	// Get/List access. Delete is a neutral probe: it does not itself apply
-	// expiry logic, so it only reports whether the entry is physically present.
+	// Wait for the background goroutine to purge the expired entry with no
+	// Get/List/Delete access at all. The map is inspected directly under the
+	// mutex, so the probe itself never removes or expires anything.
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && s.Delete("expired") {
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		_, present := s.pastes["expired"]
+		s.mu.Unlock()
+		if !present {
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if s.Delete("expired") {
-		t.Fatal("expected expired paste to be removed by the cleanup loop without any Get/List access")
+
+	s.mu.Lock()
+	_, expiredPresent := s.pastes["expired"]
+	_, keptPresent := s.pastes["kept"]
+	s.mu.Unlock()
+
+	if expiredPresent {
+		t.Fatal("expected expired paste to be removed by the cleanup loop without any Get/List/Delete access")
 	}
-	if !s.Delete("kept") {
+	if !keptPresent {
 		t.Fatal("expected non-expired paste to survive the cleanup loop")
 	}
 }
