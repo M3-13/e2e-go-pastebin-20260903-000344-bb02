@@ -55,6 +55,14 @@ func TestCreatePasteReturnsID(t *testing.T) {
 			t.Fatalf("id contains non-hex character: %q", id)
 		}
 	}
+
+	deleteToken, ok := body["delete_token"]
+	if !ok || deleteToken == "" {
+		t.Fatalf("expected non-empty delete_token, got %q", deleteToken)
+	}
+	if len(deleteToken) != 32 {
+		t.Fatalf("expected 32-char hex delete_token, got %d chars: %q", len(deleteToken), deleteToken)
+	}
 }
 
 func TestCreatePasteEmptyContent(t *testing.T) {
@@ -166,5 +174,28 @@ func TestCreatePasteNoExpiry(t *testing.T) {
 	}
 	if p.ExpiresAt != nil {
 		t.Fatalf("expected nil ExpiresAt, got %v", *p.ExpiresAt)
+	}
+}
+
+func TestCreatePasteExpiresOverflow(t *testing.T) {
+	ts, _ := newTestServer()
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/pastes", "application/json", strings.NewReader(`{"content":"Hallo","expires_in_seconds":3153600001}`))
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for overflow, got %d", resp.StatusCode)
+	}
+
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("could not decode response: %v", err)
+	}
+	if _, ok := body["error"]; !ok {
+		t.Fatalf("expected JSON error body, got %v", body)
 	}
 }

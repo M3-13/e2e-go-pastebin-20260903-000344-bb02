@@ -13,6 +13,16 @@ import (
 
 const maxPasteBodyBytes = 1 << 20 // 1 MB
 
+// maxExpireSeconds caps expires_in_seconds at roughly 10 years. It is checked
+// before the value is converted to a time.Duration so that an unreasonably
+// large request is rejected cleanly instead of overflowing the duration.
+const maxExpireSeconds = 10 * 365 * 24 * 3600
+
+// maxIDRetries bounds how many times CreatePaste regenerates a paste ID after a
+// collision before giving up. Once the store has reached store.MaxPastes,
+// store.Create fails fast and these retries exhaust immediately, yielding 503.
+const maxIDRetries = 10
+
 type createRequest struct {
 	Content          string `json:"content"`
 	Language         string `json:"language"`
@@ -39,6 +49,15 @@ func (h *Handler) CreatePaste(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.ExpiresInSeconds < 0 {
+		WriteError(w, http.StatusBadRequest, "expires_in_seconds must be positive")
+		return
+	}
+	if req.ExpiresInSeconds > maxExpireSeconds {
+		WriteError(w, http.StatusBadRequest, "expires_in_seconds exceeds the maximum allowed")
+		return
+	}
+
 	p := model.Paste{
 		Content:   req.Content,
 		Language:  req.Language,
@@ -50,26 +69,45 @@ func (h *Handler) CreatePaste(w http.ResponseWriter, r *http.Request) {
 		p.ExpiresAt = &expires
 	}
 
-	id, err := newPasteID()
+	deleteToken, err := newSecret()
 	if err != nil {
-		WriteError(w, http.StatusInternalServerError, "could not generate id")
+		WriteError(w, http.StatusInternalServerError, "could not generate delete token")
 		return
 	}
-	p.ID = id
-	if !h.store.Create(p) {
-		// Create reports failure on an ID collision or when the store is full;
-		// both are indistinguishable here, so fail the request instead of
-		// looping forever once the store has reached MaxPastes.
-		WriteError(w, http.StatusServiceUnavailable, "paste store is full")
-		return
+	p.DeleteToken = deleteToken
+
+	for attempt := 0; attempt < maxIDRetries; attempt++ {
+		id, err := newPasteID()
+		if err != nil {
+			WriteError(w, http.StatusInternalServerError, "could not generate id")
+			return
+		}
+		p.ID = id
+		if h.store.Create(p) {
+			WriteJSON(w, http.StatusCreated, map[string]string{
+				"id":           p.ID,
+				"delete_token": p.DeleteToken,
+			})
+			return
+		}
+		// Create reported false: either an ID collision or the store has reached
+		// store.MaxPastes. Retry on a fresh ID for the bounded number of attempts,
+		// then fail as unavailable.
 	}
 
-	WriteJSON(w, http.StatusCreated, map[string]string{"id": p.ID})
+	WriteError(w, http.StatusServiceUnavailable, "paste store is full")
 }
 
 // newPasteID returns a 32-character lowercase hex string built from 16
 // cryptographically random bytes (128 bits of entropy).
 func newPasteID() (string, error) {
+	return newSecret()
+}
+
+// newSecret returns a 32-character lowercase hex string built from 16
+// cryptographically random bytes (128 bits of entropy). It is used for both the
+// paste ID and the delete token.
+func newSecret() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
