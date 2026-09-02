@@ -12,7 +12,19 @@ import (
 	"pastebin/store"
 )
 
+const testAPIKey = "test-api-key"
+
+func listRequest(apiKey string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/pastes", nil)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	return req
+}
+
 func TestListPastes(t *testing.T) {
+	t.Setenv("PASTEBIN_API_KEY", testAPIKey)
+
 	s := store.New()
 	h := NewHandler(s)
 
@@ -46,9 +58,8 @@ func TestListPastes(t *testing.T) {
 	s.Create(p2)
 	s.Create(p3)
 
-	req := httptest.NewRequest(http.MethodGet, "/pastes", nil)
 	rec := httptest.NewRecorder()
-	h.ListPastes(rec, req)
+	h.ListPastes(rec, listRequest(testAPIKey))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)
@@ -76,6 +87,9 @@ func TestListPastes(t *testing.T) {
 		if _, ok := item["created_at"]; !ok {
 			t.Errorf("metadata must include created_at, got %v", item)
 		}
+		if _, ok := item["delete_token"]; ok {
+			t.Errorf("metadata must not include delete_token field, got %v", item)
+		}
 	}
 
 	ids := map[string]bool{}
@@ -91,12 +105,13 @@ func TestListPastes(t *testing.T) {
 }
 
 func TestListPastesEmptyStore(t *testing.T) {
+	t.Setenv("PASTEBIN_API_KEY", testAPIKey)
+
 	s := store.New()
 	h := NewHandler(s)
 
-	req := httptest.NewRequest(http.MethodGet, "/pastes", nil)
 	rec := httptest.NewRecorder()
-	h.ListPastes(rec, req)
+	h.ListPastes(rec, listRequest(testAPIKey))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)
@@ -105,5 +120,53 @@ func TestListPastesEmptyStore(t *testing.T) {
 	body := strings.TrimSpace(rec.Body.String())
 	if body != "[]" {
 		t.Fatalf("expected empty JSON list [], got %q", body)
+	}
+}
+
+func TestListPastesMissingKeyReturns401(t *testing.T) {
+	t.Setenv("PASTEBIN_API_KEY", testAPIKey)
+
+	s := store.New()
+	h := NewHandler(s)
+
+	rec := httptest.NewRecorder()
+	h.ListPastes(rec, listRequest(""))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	if body := rec.Body.String(); body == "" {
+		t.Fatal("expected error body")
+	}
+}
+
+func TestListPastesWrongKeyReturns401(t *testing.T) {
+	t.Setenv("PASTEBIN_API_KEY", testAPIKey)
+
+	s := store.New()
+	h := NewHandler(s)
+
+	rec := httptest.NewRecorder()
+	h.ListPastes(rec, listRequest("wrong-key"))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	if body := rec.Body.String(); body == "" {
+		t.Fatal("expected error body")
+	}
+}
+
+func TestListPastesEmptyEnvKeyReturns401(t *testing.T) {
+	t.Setenv("PASTEBIN_API_KEY", "")
+
+	s := store.New()
+	h := NewHandler(s)
+
+	rec := httptest.NewRecorder()
+	h.ListPastes(rec, listRequest(testAPIKey))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
 	}
 }
