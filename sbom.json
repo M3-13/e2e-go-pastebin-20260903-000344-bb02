@@ -1,0 +1,27 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:3f6e2a1c-9c4a-4f1b-8d0e-2a7b5c9d1e3f",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-09-03T00:00:00Z",
+    "component": {
+      "type": "application",
+      "bom-ref": "pastebin@1.0.0",
+      "name": "pastebin",
+      "version": "1.0.0",
+      "description": "Kleine Pastebin-REST-API in Go, ausschließlich mit der Standardbibliothek (net/http), ohne externe Abhängigkeiten.",
+      "purl": "pkg:golang/pastebin@1.0.0"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "go-stdlib",
+      "name": "go-stdlib",
+      "version": "1.27",
+      "description": "Go-Standardbibliothek (net/http, encoding/json, crypto/rand, crypto/subtle, sync, time u.a.); keine externen Module.",
+      "purl": "pkg:golang/stdlib@1.27"
+    }
+  ]
+}

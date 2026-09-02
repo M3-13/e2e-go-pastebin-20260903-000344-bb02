@@ -1,69 +1,121 @@
-VERDICT: CHANGES_REQUESTED
+# Sicherheitsrichtlinie
 
-## Sicherheitsbewertung
+Dieses Dokument beschreibt das Sicherheitsmodell der Pastebin-REST-API, die
+unterstützten Versionen, den Meldeweg für Sicherheitslücken und die
+Update-/Patch-Prozedur. Es richtet sich an Betreiber, Entwickler und
+Sicherheitsforscher.
 
-**Hinweis:** Für diesen Projekttyp (`go-backend`) wurden keine Security-Scanner (bandit / pip-audit / npm audit / semgrep) ausgeführt oder geliefert. Die Bewertung beruht daher ausschließlich auf der manuellen Analyse des sichtbaren Quellcodes. Es wurden keine Hinweise auf einkompilierte Secrets, SQL-/Command-Injection, unsichere Deserialisierung, XSS oder SSRF gefunden. Die Kernfunktionen (ID-Erzeugung per `crypto/rand`, Body-Limit, JSON-Fehler, Mutex-Schutz, Entfernen abgelaufener Pastes) sind sauber umgesetzt.
+## Sicherheitsmodell
 
-Die folgenden Findings begründen die Entscheidung **CHANGES_REQUESTED** (mittelgradige Härtungsmaßnahmen).
+Die API ist ein öffentlicher Pastebin-Dienst. Es gibt keine
+Benutzerkonten und keine serverseitige Sitzung. Der Zugriffsschutz beruht
+stattdessen auf drei voneinander unabhängigen Mechanismen:
 
----
+### 1. Linkbasiertes Lesen über eine unknackbare ID
 
-### 1. Ressourcenerschöpfung durch unbegrenzte Paste-Anlage (medium)
+Jeder Paste erhält beim Anlegen eine zufällige ID aus 32 Hex-Zeichen, die aus
+16 Bytes von `crypto/rand` erzeugt wird (128 Bit Entropie). Die ID ist der
+einzige Schlüssel zum Lesen: `GET /pastes/{id}` ist unauthentifiziert und
+liefert den Inhalt an jeden, der die ID kennt (Capability-Modell).
 
-- **Betroffene Stelle:** `store/store.go` (Store ohne Gesamtlimit), `handler/create.go` (POST `/pastes` ohne Ratenbegrenzung), `main.go` (keine vorgelagerte Begrenzung)
-- **Beschreibung:** Jeder Client kann unauthentifiziert beliebig viele Pastes mit jeweils bis zu 1 MB Inhalt anlegen. Da der Store rein im Arbeitsspeicher liegt und weder die Anzahl der Pastes noch die Gesamtspeichermenge begrenzt ist, kann ein Angreifer den Prozess mit vielen großen Pastes füllen und so einen Denial-of-Service (Speicher-/CPU-Ressourcenerschöpfung) auslösen. Es existiert kein Hintergrund-Job, der abgelaufene Einträge entfernt; sie werden nur bei Zugriff über `GET`/`List` gelöscht und können bei ständig neuen Anlagen ungenutzt im Speicher verbleiben.
-- **Konkrete Härtung:**
-  - Im `Store` eine maximale Anzahl von Pastes oder eine globale Byte-Grenze einführen (z. B. `maxPastes`, `maxTotalBytes`). Beim Überschreiten `Create` ablehnen oder älteste/abgelaufene Einträge verdrängen.
-  - Alternativ auf Handler-/Middleware-Ebene ein Rate-Limiting pro Client-IP (z. B. Token-Bucket) für `POST /pastes` ergänzen.
-  - Optional einen periodischen Goroutine-Cleanup für abgelaufene Einträge einplanen, damit der Speicher nicht unnötig wächst.
+- Wer die ID nicht kennt, kann den Paste nicht abrufen; ein Erraten ist
+  kryptographisch nicht praktikabel.
+- Die ID wird in der URL übertragen und gilt als vertraulich. Sie darf nicht
+  protokolliert, in Referrer-Headern oder in Zugriffsprotokollen Dritter
+  auftauchen (der Betreiber muss dies in vorgelagerten Proxies unterbinden).
 
----
+### 2. Delete-Token für das Löschen
 
-### 2. Unverschlüsselter Transport (medium)
+Beim Anlegen liefert `POST /pastes` zusätzlich zur ID ein `delete_token`
+(ebenfalls 32 Hex-Zeichen aus `crypto/rand`). Löschen ist nur mit diesem Token
+möglich: `DELETE /pastes/{id}` verlangt den Header `X-Delete-Token`, der dem
+Token des Pastes entsprechen muss. Der Vergleich erfolgt in konstanter Zeit
+(`crypto/subtle.ConstantTimeCompare`), um Timing-Angriffe auszuschließen.
 
-- **Betroffene Stelle:** `main.go`, Zeile `http.ListenAndServe(":"+port, newApp())`
-- **Beschreibung:** Der Server lauscht ausschließlich über unverschlüsseltes HTTP. Falls die API direkt aus dem Internet erreichbar ist, können Paste-Inhalte, Metadaten und IDs im Klartext mitgelesen werden. Da die Inhalte potenziell sensibel sein können (Pastebin), ist eine Transportverschlüsselung erforderlich.
-- **Konkrete Härtung:**
-  - Entweder TLS direkt im Go-Prozess aktivieren (z. B. `http.ListenAndServeTLS` mit Server-Zertifikat) oder
-  - im Deployment klarstellen, dass der Server nur hinter einem TLS-terminierenden Reverse-Proxy (nginx, Caddy, Load Balancer) betrieben wird und der Go-Port (`8080`) nicht öffentlich exponiert ist.
-  - Zusätzlich dokumentieren, dass `PORT` intern und nicht als öffentlicher HTTP-Endpunkt genutzt werden sollte.
+- Ohne gültiges Token antwortet die API mit `401`.
+- Das Token wird ausschließlich in der Antwort auf `POST /pastes` zurückgegeben
+  und nirgends gespeichert oder protokolliert. Es ist geheim zu behandeln.
+- Wer ein `delete_token` verliert, kann den zugehörigen Paste nicht löschen.
 
----
+### 3. API-Key für die Auflistung
 
-### 3. Overflow bei `expires_in_seconds` (low)
+Die Metadatenauflistung `GET /pastes` ist kein öffentlicher Endpunkt: Sie
+verlangt den Header `X-API-Key`, der dem in der Umgebungsvariable
+`PASTEBIN_API_KEY` hinterlegten Wert entsprechen muss. Ist die Variable nicht
+gesetzt oder leer, ist der Endpunkt deaktiviert und antwortet immer mit `401`.
 
-- **Betroffene Stelle:** `handler/create.go`, Zeile `expires := time.Now().Add(time.Duration(req.ExpiresInSeconds) * time.Second)`
-- **Beschreibung:** `req.ExpiresInSeconds` wird als `int` dekodiert und ohne Ober­grenze in `time.Duration` umgewandelt. Bei sehr großen Werten (nahe `math.MaxInt`) kann die Multiplikation mit `time.Second` überlaufen, was zu einem negativen oder unerwartet kleinen `time.Duration` führt. Der Paste läuft dann sofort oder zu einem falschen Zeitpunkt ab. Ein direkter schwerwiegender Exploit ist nicht möglich, aber es handelt sich um eine vermeidbare Robustheitslücke.
-- **Konkrete Härtung:**
-  - Eine Obergrenze definieren, z. B. `const maxExpireSeconds = 10 * 365 * 24 * 3600` (10 Jahre) oder `math.MaxInt64 / int64(time.Second)`.
-  - Vor der Umwandlung prüfen: `if req.ExpiresInSeconds > maxExpireSeconds { WriteError(400, "expires_in_seconds too large"); return }`.
-  - Negative Werte werden bereits durch `if req.ExpiresInSeconds > 0` ignoriert – das ist korrekt.
+- Der API-Key wird ausschließlich über die Umgebung konfiguriert und darf nie
+  im Repository oder in der Dokumentation als Klartextwert stehen.
+- Es gibt keine Unterscheidung nach Mandant oder Nutzer; ein gültiger Key
+  gewährt Zugriff auf die gesamte Liste.
 
----
+### Weitere Schutzmaßnahmen
 
-### 4. Weit geöffnete CORS-Richtlinie (low / Hinweis)
+- **Begrenzung des Request-Bodys:** `POST /pastes` liest höchstens 1 MB
+  (`http.MaxBytesReader`); größere Anfragen werden mit `413` abgewiesen.
+- **Begrenzung der Ablaufzeit:** `expires_in_seconds` ist auf etwa 10 Jahre
+  begrenzt; größere Werte werden mit `400` abgewiesen, um einen
+  `time.Duration`-Überlauf auszuschließen.
+- **Begrenzung der Pastes-Anzahl:** Der Store fasst höchstens 10 000 Pastes
+  (`store.MaxPastes`). Darüber hinaus schlägt das Anlegen mit `503` fehl.
+- **Automatischer Ablauf-Cleanup:** Abgelaufene Pastes werden beim Zugriff
+  (`Get`/`List`) sowie durch eine Hintergrund-Goroutine entfernt.
+- **Einheitliche Fehlerantworten:** Alle Antworten mit Status ≥ 400 sind ein
+  JSON-Objekt mit ausschließlich einem generischen `error`-Feld — ohne
+  Stacktraces, Dateipfade oder interne Details.
+- **Transportverschlüsselung:** Der Server unterstützt TLS über die
+  Umgebungsvariablen `CERT_FILE` und `KEY_FILE`. Sind beide gesetzt, wird
+  `ListenAndServeTLS` verwendet und zusätzlich der HSTS-Header
+  `Strict-Transport-Security` gesetzt. Ohne eigene Zertifikate ist der Server
+  für den Betrieb hinter einem TLS-terminierenden Reverse-Proxy vorgesehen und
+  darf nicht direkt ins Internet exponiert werden.
+- **CORS-Allowlist:** Der `Access-Control-Allow-Origin`-Header wird nur für
+  Origins gesetzt, die in `CORS_ALLOWED_ORIGINS` (kommagetrennt) aufgeführt
+  sind. Eine leere Allowlist setzt keinen Header und verweigert damit
+  standardmäßig jeden Cross-Origin-Zugriff.
 
-- **Betroffene Stelle:** `main.go`, `corsMiddleware`
-- **Beschreibung:** `Access-Control-Allow-Origin: *` ist gemäß **AC-12** explizit gefordert und für eine API ohne cookies/authentifizierte Sitzungen unkritisch. Sobald die API jedoch um Authentifizierung (z. B. Session-Cookies oder Authorization-Header mit Browser-Zugriff) erweitert wird, würde `*` es beliebigen Websites ermöglichen, Antworten im Browserkontext zu lesen. Aktuell besteht kein unmittelbares Risiko.
-- **Konkrete Härtung (für spätere Erweiterungen):**
-  - Ursprung konfigurierbar machen (Whitelist) und bei nicht-`*`-Antworten `Vary: Origin` setzen.
-  - Preflight-Verhalten (`OPTIONS`) berücksichtigen, sobald browserbasierte Clients mit nicht-einfachen Anfragen verwendet werden.
+## Unterstützte Versionen
 
----
+Es wird ausschließlich die jeweils aktuelle Version unterstützt. Ältere
+Versionen erhalten keine Sicherheits-Patches.
 
-### 5. Eingeschränkte Fehlerbehandlung bei JSON-Dekodierung (Hinweis, kein Finding)
+| Version | Unterstützt          |
+| ------- | -------------------- |
+| 1.0.0   | :white_check_mark:   |
 
-- **Betroffene Stelle:** `handler/create.go`
-- **Beschreibung:** `json.NewDecoder(r.Body).Decode(&req)` liest nur das erste JSON-Objekt; nachfolgende Daten werden ignoriert. Das ist bei einem Request-Body unüblich, aber wegen `http.MaxBytesReader` nicht ausnutzbar. Kein Handlungsbedarf, aber bewusst zur Kenntnis genommen.
+## Meldung von Sicherheitslücken
 
----
+Wenn du eine Sicherheitslücke in diesem Projekt entdeckst, melde sie bitte
+**nicht** über ein öffentliches Issue, sondern vertraulich an den Betreiber:
 
-## Zusammenfassung
+- **E-Mail:** `security@example.invalid` (bitte durch die tatsächliche
+  Betreiberadresse ersetzen)
+- **Betreff:** `[Sicherheitslücke] <Kurzbeschreibung>`
 
-- **Secrets:** keine gefunden.
-- **Injection/Inputs:** keine SQL-/Command-/Path-Injection; Body-Limit und JSON-Validierung vorhanden.
-- **AuthN/AuthZ:** keine Authentifizierung implementiert; Zugriffsschutz basiert auf 128-Bit-Zufalls-IDs (Capability-Modell). Für einen öffentlichen Pastebin-Dienst akzeptabel. Kein Auth-Bypass, da keine geschützten Funktionen existieren.
-- **Dependencies:** Keine externen Abhängigkeiten erkennbar (`go.mod` enthält nur Moduldefinition und Go-Version); keine bekannten Schwachstellen. Es liefen jedoch keine Dependency-Scanner.
-- **Configuration/Transport:** TLS fehlt auf Anwendungsebene (siehe Finding 2). CORS `*` ist spezifikationskonform, aber für spätere Auth-Erweiterungen einzuengen.
+Bitte gib in der Meldung so viel Kontext wie möglich an:
 
-**Begründung des Verdikts:** Die gefundenen mittelgradigen Risiken (Ressourcen-DoS, unverschlüsselter Transport) rechtfertigen eine Überarbeitung vor der Auslieferung. Es wurden keine kritischen oder hohen Schwachstellen festgestellt, daher kein `BLOCKED`.
+- betroffene Version und Komponente,
+- eine Beschreibung der Schwachstelle und ihres Auswirkungen,
+- Schritte zur Reproduktion (sofern vorhanden),
+- ein Proof-of-Concept oder eine betroffene URL, falls möglich.
+
+Wir bestätigen den Eingang innerhalb von 5 Werktagen und streben an, innerhalb
+von 90 Tagen eine Lösung zu veröffentlichen. Wir veröffentlichen Details erst,
+nachdem ein Fix bereitsteht. Sobald die Schwachstelle behoben ist, wird sie im
+CHANGELOG und ggf. in einer Sicherheitsadvisory dokumentiert.
+
+## Update- und Patch-Prozedur
+
+1. Sicherheitsrelevante Änderungen werden als regulärer Fix auf `main` gemergt
+   und über den CI-Pfad gebaut und getestet (`go build ./...`, `go test ./...`).
+2. Jede Änderung wird im [CHANGELOG.md](CHANGELOG.md) unter der entsprechenden
+   Version dokumentiert.
+3. Ein Update besteht aus dem Einspielen der neuen Version und dem Neustart des
+   Dienstes über den in `RUN.json` deklarierten Startbefehl (`go run .`).
+4. Nach einem Update sind die Umgebungsvariablen (`CERT_FILE`, `KEY_FILE`,
+   `CORS_ALLOWED_ORIGINS`, `PASTEBIN_API_KEY`) zu prüfen und, wo nötig, zu
+   erneuern (insbesondere API-Keys und Zertifikate rotieren).
+5. Wird eine Schwachstelle in einer Drittanbieter-Abhängigkeit gemeldet, ist
+   die betroffene Version zu ermitteln und ein Upgrade einzuspielen. Aktuell
+   verwendet das Projekt keine externen Abhängigkeiten über die
+   Go-Standardbibliothek hinaus (siehe `sbom.json`).
