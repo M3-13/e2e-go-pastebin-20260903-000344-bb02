@@ -1,111 +1,117 @@
-VERDICT: BLOCKED
+VERDICT: CHANGES_REQUESTED
 
-Geprüft wird der gemergte Stand des `go-backend`-Pastebin-Dienstes. Reines Backend ohne Endnutzer-UI, daher entfallen Cookie-/Legal-Notice-/Accessibility-Pflichten im Code. Geprüft wurden DSGVO und EU Cyber Resilience Act (CRA). Der EU AI Act ist nicht anwendbar, da kein KI-Feature vorhanden ist.
+## Prüfbericht — Pastebin-REST-API in Go (`go-backend`)
 
----
+Prüfgegenstand ist der im Branch vorhandene, gemergte Produktstand. Reines Backend ohne Endnutzer-UI: Cookie-/Legal-Notice-/Barrierefreiheitspflichten sind daher nicht einschlägig. Geprüft wurden DSGVO, CRA sowie mittelbar Marktreife/Sicherheitsverhalten der API.
 
-## DSGVO
-
-### 1. Kritisch — Öffentlicher, unauthentifizierter Zugriff auf alle Pastes und deren IDs
-**Befund:**  
-Die API verarbeitet zwingend personenbezogene Daten (Paste-Inhalte sind nutzergeneriert und können personenbezogene Daten enthalten). Es gibt jedoch keinerlei Authentifizierung oder Autorisierung:
-- `GET /pastes` listet alle IDs öffentlich auf.
-- `GET /pastes/{id}` liefert jeden Paste an jeden, der die ID kennt.
-- `DELETE /pastes/{id}` erlaubt jedem, fremde Pastes zu löschen.
-
-Eine Rechtsgrundlage für diese öffentliche Zugänglichmachung ist im Code nicht erkennbar. Es fehlt jede Einwilligung, jedes Vertragsverhältnis oder eine sonstige Rechtsgrundlage nach Art. 6 DSGVO. Dies verletzt Art. 5 Abs. 1 lit. a und f, Art. 25 und Art. 32 DSGVO fundamental.
-
-**Abhilfe:**
-- Authentifizierung und Autorisierung einführen, z. B. API-Key pro Mandant/User (`main.go`, `handler/*.go`).
-- Beim Anlegen (`POST /pastes`) ein zusätzliches, geheimes Besitz-/Delete-Token zurückgeben, das für `DELETE /pastes/{id}` erforderlich ist (`handler/create.go`, `handler/delete.go`, `model/paste.go`).
-- `GET /pastes` nur für berechtigte Nutzer oder ohne öffentliche ID-Auflistung; alternativ die Liste auf eigene Pastes beschränken (`handler/list.go`, `main.go`).
-- Diese Maßnahmen sind mit den Funktionen vereinbar, erfordern aber eine Anpassung der Schnittstelle und der Tests.
-
-### 2. Kritisch — Unbefugtes Löschen fremder Pastes
-**Befund:**  
-`DELETE /pastes/{id}` verlangt keinerlei Berechtigung. Jeder, der eine ID kennt oder über `GET /pastes` erhält, kann den Eintrag irreversibel löschen. Das ist ein Verstoß gegen Integrität und Vertraulichkeit sowie gegen Art. 5 Abs. 1 lit. f DSGVO.
-
-**Abhilfe:**
-- Besitz-Token wie unter Punkt 1 einführen.
-- `DELETE` nur mit gültigem Token oder nach Authentifizierung des Eigentümers zulassen (`handler/delete.go`, Tests in `handler/delete_test.go` anpassen).
-
-### 3. Hoch — Fehlende Transportverschlüsselung (TLS)
-**Befund:**  
-`main.go` verwendet `http.ListenAndServe(":"+port, newApp())` und überträgt alle Daten im Klartext. Personenbezogene Inhalte können auf dem Transportweg mitgelesen werden (Art. 32 DSGVO).
-
-**Abhilfe:**
-- TLS aktivieren: `http.ListenAndServeTLS(":"+port, certFile, keyFile, newApp())` oder verbindlich einen TLS-terminierenden Reverse Proxy vorschreiben.
-- Zusätzlich HSTS-Header setzen, sobald HTTPS aktiv ist (`main.go`, `corsMiddleware`).
-
-### 4. Hoch — Kein automatischer Cleanup abgelaufener Pastes ohne Zugriff
-**Befund:**  
-Abgelaufene Pastes werden nur bei `Get` oder `List` physisch entfernt (`store/store.go`). Wird ein abgelaufener Paste nie wieder angefordert, bleibt er dauerhaft im Speicher. Das verletzt die Speicherbegrenzung nach Art. 5 Abs. 1 lit. e DSGVO.
-
-**Abhilfe:**
-- Hintergrund-Goroutine mit `time.Ticker` einführen, die regelmäßig abgelaufene Einträge aus der Map löscht, z. B. in `store.New()` oder `main.go` (`store/store.go`, `main.go`).
-- Alternativ einen Scheduler im Store starten, der bei jeder Minute alle abgelaufenen IDs löscht.
-
-### 5. Mittel — CORS `Access-Control-Allow-Origin: *`
-**Befund:**  
-`main.go` setzt pauschal `Access-Control-Allow-Origin: *`. In Kombination mit personenbezogenen Inhalten und fehlender Authentifizierung erlaubt dies beliebigen Websites einen unkontrollierten Zugriff aus dem Browser.
-
-**Abhilfe:**
-- Statt `*` eine explizite Allowlist vertrauenswürdiger Origins setzen (`main.go`, `corsMiddleware`).
-- Sofern die API absichtlich öffentlich bleiben soll, zumindest dokumentieren und die Reichweite begrenzen.
-
-### 6. Mittel — Fehlende Transparenz- und Rechtsgrundlagen-Dokumentation
-**Befund:**  
-Auch ohne UI muss der Betreiber die Datenverarbeitung nach Art. 13 DSGVO dokumentieren, insbesondere Zweck, Rechtsgrundlage, Speicherdauer und Betroffenenrechte. Im Repository ist keine solche Dokumentation sichtbar.
-
-**Abhilfe:**
-- `README.md` oder besser `PRIVACY.md` ergänzen mit Rechtsgrundlage (z. B. Art. 6 Abs. 1 lit. b DSGVO für die Vertragserfüllung und ggf. Art. 6 Abs. 1 lit. a für öffentliche Veröffentlichung), Speicherdauer, Löschkonzept, Rechte der betroffenen Personen.
+Positiv hervorzuheben: keine Logger-Ausgabe von Paste-Inhalten, `crypto/rand` mit 128 Bit für ID/Delete-Token, Größenbegrenzung des Request-Bodys, mutex-geschützter Store, physisches Entfernen abgelaufener Pastes, kein `content`/`delete_token` in `GET /pastes`, JSON-Fehler ohne Stacktraces/Dateipfade sowie HSTS nur im TLS-Modus.
 
 ---
 
-## EU Cyber Resilience Act (CRA)
+## 1. DSGVO / Datenschutz
 
-### 1. Hoch — Fehlende Authentifizierung/Autorisierung
-**Befund:**  
-Wie unter DSGVO dargestellt, fehlt jede Zugriffskontrolle. Das verletzt die CRA-Anforderungen an „security by design/default“ (unbefugter Zugriff, Manipulation und Löschung).
+### DSGVO-D1 — Unbegrenzte Speicherung ohne Ablauf (mittel)
+**Datei:** `store/store.go`, `handler/create.go`, `model/paste.go`
 
-**Abhilfe:**  
-Authentifizierung/API-Keys und Besitz-Token implementieren (siehe DSGVO Punkte 1 und 2).
+Pastes ohne `expires_in_seconds` werden dauerhaft im In-Memory-Store gehalten. Da `content` nach dem Modell beliebige, auch personenbezogene Inhalte enthalten kann, fehlt eine wirksame technische Durchsetzung des Grundsatzes der Speicherbegrenzung nach Art. 5 Abs. 1 lit. e DSGVO.
 
-### 2. Hoch — Keine Update-/Patch-Dokumentation, kein SBOM, keine dokumentierten Sicherheitseigenschaften
-**Befund:**  
-Es gibt keine sichtbare `SECURITY.md`, keine dokumentierte Update-/Patch-Prozedur und kein Software Bill of Materials (SBOM). `go.mod` enthält offenbar keine externen Abhängigkeiten (gut), aber die CRA verlangt dokumentierte Sicherheitsmerkmale und ein Inventar der Komponenten.
+**Remedy:** Eine betreiberseitig konfigurierbare Höchstspeicherdauer einführen, z. B. `PASTEBIN_MAX_RETENTION_SECONDS`. Wenn gesetzt, muss `CreatePaste` für Pastes ohne eigenes `expires_in_seconds` ein Ablaufdatum auf `now + MaxRetention` setzen. Der Standardwert `0` erhält das aktuelle Verhalten und damit AC-08; im Produktionsbetrieb muss der Betreiber den Wert setzen oder in `PRIVACY.md` eine ausdrücklich begründete Rechtsgrundlage und Löschroutine dokumentieren. Keine pauschale Standard-TTL erzwingen, weil sonst AC-08 bewusst gebrochen würde.
 
-**Abhilfe:**
-- `SECURITY.md` oder `README.md` um Sicherheitsmodell, Meldewege und Update-Prozess ergänzen.
-- SBOM erzeugen, z. B. mit `go version -m` oder einem CycloneDX-Tool, und im Repo ablegen.
-- Versions- und Changelog-Datei einführen.
+### DSGVO-D2 — Löschweg nur über einmalig ausgegebenen Delete-Token (niedrig)
+**Datei:** `handler/delete.go`, `PRIVACY.md`
 
-### 3. Mittel — Fehlende Transportverschlüsselung
-**Befund:**  
-Wie unter DSGVO Punkt 3. CRA verlangt sichere Standardkonfigurationen; Klartext-HTTP ist ein Mangel.
+Eine Löschung ist nur mit dem bei `POST /pastes` zurückgegebenen `X-Delete-Token` möglich. Verliert die betroffene Person den Token, besteht im Produkt kein Löschweg. Das ist kein zwingender Codeblocker, aber betroffen ist die praktische Durchsetzung des Rechts auf Löschung, Art. 17 DSGVO.
 
-**Abhilfe:**  
-TLS aktivieren oder verbindlich extern terminieren lassen (`main.go`).
+**Remedy:** In `PRIVACY.md` einen Betreiberprozess für Löschersuchen dokumentieren (Kontakt, Identifikation der Paste-ID, Fristen). Optional im Code einen administrativen Löschweg hinter dem vorhandenen API-Key-Mechanismus ergänzen, ohne den normalen DELETE-Endpunkt zu verändern.
 
-### 4. Niedrig — Fehlende Ressourcen- und Rate-Limits
-**Befund:**  
-Es gibt keine Begrenzung der Anzahl anlegbarer Pastes und keine Rate-Limits. Das kann zu Ressourcenüberlastung und Denial-of-Service führen.
+### DSGVO-D3 — Unverschlüsselter HTTP-Betrieb möglich (hoch)
+**Datei:** `main.go`
 
-**Abhilfe:**  
-Rate-Limiting pro Client/IP und ggf. eine maximale Anzahl aktiver Pastes implementieren (`main.go`, `handler/create.go`).
+Die Anwendung fällt auf `http.ListenAndServe` zurück, sobald `CERT_FILE`/`KEY_FILE` nicht gesetzt sind. Paste-Inhalte können personenbezogene Daten enthalten; eine Übertragung ohne TLS verletzt regelmäßig die Anforderungen an die Vertraulichkeit und Integrität nach Art. 32 DSGVO, wenn der Dienst nicht ausschließlich hinter einem TLS-terminierenden Reverse-Proxy betrieben wird.
+
+**Remedy:** Sichere Standardeinstellung herstellen: Ohne `CERT_FILE`/`KEY_FILE` soll der Prozess im Produktionsmodus nicht starten. Für lokale Entwicklung eine ausdrückliche Opt-in-Umgebungsvariable einführen, z. B. `INSECURE_HTTP=1` oder `ALLOW_PLAINTEXT_HTTP=1`. Alternativ in `README.md`/`SECURITY.md` verpflichtend dokumentieren, dass Produktionsbetrieb ausschließlich hinter TLS-Proxy erfolgt; der Code allein sollte den ungesicherten Fall nicht stillschweigend wählen.
+
+### DSGVO-D4 — API-Key-Vergleich nicht in konstanter Zeit (niedrig)
+**Datei:** `handler/list.go`
+
+`apiKeyAuthorized` vergleicht den API-Key mit `==`. Das erlaubt potenzielle Timing-Unterschiede und erleichtert Angriffe auf das Geheimnis.
+
+**Remedy:** Analog zu `handler/delete.go` den Vergleich auf `crypto/subtle.ConstantTimeCompare([]byte(expected), []byte(received))` umstellen.
 
 ---
 
-## EU AI Act
-Nicht anwendbar. Im Code ist keine KI-Funktion enthalten.
+## 2. EU Cyber Resilience Act (CRA)
 
-## Mandatory texts & UI
-Für dieses reine Backend entfallen Cookie-Banner, Impressum und Accessibility-Pflichten. Die DSGVO-Transparenzpflicht (Art. 13) bleibt jedoch bestehen und ist unter DSGVO Punkt 6 adressiert.
+### CRA-C1 — Fehlende sichere Standardeinstellung bei Transportverschlüsselung (hoch)
+**Datei:** `main.go`
 
-## Accessibility
-Entfällt mangels öffentlicher Web-UI.
+Identischer Sachverhalt wie DSGVO-D3. Ein Produkt mit digitalen Elementen muss nach CRA mit sicheren Grundeinstellungen ausgeliefert werden. Der automatische Fallback auf Klartext-HTTP widerspricht Security-by-Default.
+
+**Remedy:** Wie DSGVO-D3: TLS erzwingen oder unsicheren HTTP-Betrieb nur über eine explizite Opt-in-Umgebungsvariable erlauben. In `SECURITY.md` die Deployment-Anforderung und den Mechanismus dokumentieren.
+
+### CRA-C2 — CORS-Preflight nicht funktional (mittel)
+**Datei:** `main.go`, `handler/handler.go`
+
+`corsMiddleware` setzt lediglich `Access-Control-Allow-Origin` und `Vary`, behandelt aber keine `OPTIONS`-Preflight-Anfragen. Der Mux lässt auf `/pastes` und `/pastes/{id}` nur GET/POST bzw. GET/DELETE zu; `OPTIONS` führt daher zu 405. Damit sind Cross-Origin-Aufrufe mit `Content-Type: application/json`, `X-Delete-Token` oder `X-API-Key` aus Browsern faktisch blockiert. Das ist ein Sicherheits- und Interoperabilitätsdefekt, der auch die dokumentierte CORS-Funktion im Produkt nicht erfüllt.
+
+**Remedy:** In `corsMiddleware` Preflight-Anfragen vor dem Weiterreichen abfangen: Bei `OPTIONS` und vorhandenem `Access-Control-Request-Method` für eine erlaubte Origin direkt mit Status 204 beantworten. Zusätzlich Header setzen:
+- `Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS`
+- `Access-Control-Allow-Headers: Content-Type, X-Delete-Token, X-API-Key`
+- `Access-Control-Max-Age: 86400`
+- `Vary: Origin`
+
+Die normalen, nicht-Preflight-Ressourcen bleiben unverändert; dadurch werden keine vorhandenen API-Aufrufe gebrochen.
+
+### CRA-C3 — Kein Rate-Limit/Schutz vor Ressourcenauslastung (mittel)
+**Datei:** `main.go`, `store/store.go`, `handler/create.go`
+
+`MaxPastes` begrenzt die Anzahl, aber bei `MaxPastes = 10000` und je `1 MB` Request-Body kann der Speicher bis in den zweistelligen GB-Bereich getrieben werden. Es fehlt eine Ratenbegrenzung oder IP-/API-Key-bezogene Missbrauchskontrolle. Für Security-by-Default und Verfügbarkeit ist das relevant.
+
+**Remedy:** Middleware zur Ratenbegrenzung einführen, z. B. Token-Bucket pro Quell-IP und für `GET /pastes` pro API-Key. Konfigurierbar über Umgebungsvariablen wie `RATE_LIMIT_REQUESTS_PER_MIN` und `RATE_LIMIT_BURST`, Standardwerte moderat wählen. `MaxPastes` zusätzlich über eine Umgebungsvariable konfigurierbar machen, z. B. `PASTEBIN_MAX_PASTES`.
+
+### CRA-C4 — SBOM und Sicherheitsdokumentation vorhanden, aber nicht inhaltlich prüfbar (niedrig)
+**Datei:** `sbom.json`, `SECURITY.md`, `COMPLIANCE.md`, `go.mod`
+
+Die Dateien existieren im Branch, ihr Inhalt ist jedoch nicht Teil des gezeigten Prüfstands. Für CRA-Konformität müssen daraus Abhängigkeiten samt Versionen, unterstützter Zeitraum, Meldeweg für Schwachstellen und Update-/Patch-Prozess hervorgehen.
+
+**Remedy:** Vor Freigabe `sbom.json` gegen `go.mod` validieren. In `SECURITY.md` mindestens folgende Abschnitte sicherstellen: „Security Properties“, „Supported Versions“, „Reporting a Vulnerability“, „Update/Patch Process“. `COMPLIANCE.md` mit den CRA-Bezügen abgleichen. Da die Dateien vorhanden sind, ist dies eine Prüf-/Ergänzungsanforderung, kein Neuaufbau.
 
 ---
 
-**Zusammenfassung:**  
-Der Dienst verarbeitet personenbezogene Daten ohne erkennbare Rechtsgrundlage für die öffentliche Zugänglichkeit und ohne jede Zugriffskontrolle. Jeder kann Pastes lesen und fremde Pastes löschen. Hinzu kommen fehlende Transportverschlüsselung und fehlender automatischer Ablauf-Cleanup. Dies sind fundamentale Datenschutz- und CRA-Verstöße, daher **BLOCKED**.
+## 3. EU AI Act
+
+Nicht anwendbar. Im Produkt ist keine KI-Funktion enthalten; es bestehen keine Pflichten nach Risikoklassen, Transparenz- oder Kennzeichnungspflichten.
+
+---
+
+## 4. Pflichttexte & UI
+
+Pflichten für Cookie-Banner, Impressum, Widerrufsbelehrung oder Barrierefreiheit bestehen für dieses reine Backend ohne Endnutzer-Web-UI nicht.
+
+Allerdings ist für den Betrieb als API mit personenbezogenen Inhalten eine Datenschutzinformation für betroffene Personen/API-Kunden erforderlich.
+
+### UI-M1 — Inhalt von `PRIVACY.md` nicht verifizierbar (mittel)
+**Datei:** `PRIVACY.md`
+
+Die Datei existiert, ihr Inhalt ist im gezeigten Stand nicht sichtbar. Für DSGVO-Konformität muss sie mindestens abdecken: Verantwortlicher, Zwecke und Rechtsgrundlagen, Kategorien personenbezogener Daten, Speicherdauer/Löschkonzept, Betroffenenrechte, Beschwerderecht bei der Aufsichtsbehörde.
+
+**Remedy:** `PRIVACY.md` inhaltlich gegen Art. 13 und 14 DSGVO prüfen und fehlende Abschnitte ergänzen. Da kein Web-UI existiert, ist kein Cookie- oder Legal-Notice-Banner erforderlich.
+
+---
+
+## 5. Barrierefreiheit / WCAG / BITV / EAA
+
+Nicht anwendbar. Es gibt keine öffentliche Web-Oberfläche. Falls später ein Web-Client bereitgestellt wird, wären die EAA/WCAG-Pflichten für diesen Client neu zu bewerten.
+
+---
+
+## 6. Abstimmung: Auflagen vs. Produktfunktion
+
+Die vorgeschlagenen Maßnahmen sind so gewählt, dass sie bestehende Akzeptanzkriterien nicht brechen:
+
+- TLS-Zwang erfolgt nur mit expliziter Ausnahme für lokale Entwicklung, nicht als kategorische Blockade.
+- Die Höchstspeicherdauer wird als optionale, betreiberseitig gesetzte Obergrenze eingeführt; bei `0` bleibt das dauerhafte Abrufen ohne Ablauf gemäß AC-08 erhalten.
+- Der CORS-Preflight ergänzt nur die bisher fehlende `OPTIONS`-Behandlung und lässt GET/POST/DELETE unverändert.
+- Ratenbegrenzung ist konfigurierbar und mit moderaten Standardwerten umsetzbar.
+
+Damit bestehen keine fundamentalen Rechtsverstöße, die eine Sperrung (`BLOCKED`) rechtfertigen. Die genannten Punkte sind vor Marktfreigabe zu beheben.
